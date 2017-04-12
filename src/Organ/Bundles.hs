@@ -1,12 +1,17 @@
+{-# LANGUAGE OverloadedLists #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeInType #-}
 {-# LANGUAGE ViewPatterns        #-}
 module Organ.Bundles where
 
 import           Control.Concurrent
 import           Control.Monad
 import           Control.Monad.Primitive
-import           Data.Vec
+import Data.Proxy
+import           Data.VecLit
 import qualified Data.Vector.Unboxed.Mutable as UM
+import GHC.Exts
 import           GHC.TypeLits
 import           Organ
 
@@ -14,16 +19,17 @@ newtype Sources ar m a = Sources (Vec ar (Src m a))
 newtype Sinks   ar m a = Sinks (Vec ar (Snk m a))
 
 -- | Returns a new source that consumes the argument sources in sequence
-funnel :: Monoid m => Sources m a -> Src m a
-funnel (Sources ss)= mconcat ss
+funnel :: KnownNat ar => Monoid m => Sources ar m a -> Src m a
+funnel (Sources ss)= mconcat (GHC.Exts.toList ss)
 
 -- | Returns a new bundle where every source pulls from the argument source
 --   * The sources in the bundle ignore Full sinks and so the
 --     argument source will only release resources when fully depleted
-unfunnel_i :: Int -> Src (IO()) a -> IO(Sources (IO()) a)
-unfunnel_i n src = do
+unfunnel_i :: forall ar a . KnownNat ar => Src (IO()) a -> IO(Sources ar (IO()) a)
+unfunnel_i src = do
+  let n = natVal (Proxy @ ar)
   state   <- newMVar src
-  aborted <- UM.new n ; UM.set aborted False
+  aborted <- UM.new (fromIntegral n) ; UM.set aborted False
   -- When all the children have seen a Full, we want to notify the original source
   let run i Full = do
         UM.write aborted i True
@@ -38,11 +44,11 @@ unfunnel_i n src = do
               Cons a src' -> do
                 putMVar state src'
                 k $ Cons a (run i)
-  return $ Sources $ map run [0 .. n-1]
+  return $ Sources $ fmap run [0 .. ]
 
 -- | Returns a bundle of sinks that all push to the argument sink
 --   The argument sink is done when all the result sinks are done
-unfunnel_o :: forall a. Int -> Snk (IO ()) a -> IO(Sinks (IO ()) a)
+unfunnel_o :: forall ar a. KnownNat ar => Int -> Snk (IO ()) a -> IO(Sinks ar (IO ()) a)
 unfunnel_o n parent = do
   arr <- UM.replicate n False
   state <- newMVar parent
@@ -61,11 +67,11 @@ unfunnel_o n parent = do
             Cont sink' -> do
               putMVar state sink'
               src $ Cont (run i)
-  return $ Sinks $ map run [0..n-1]
+  return $ Sinks $ fromList $ map run [0..n-1]
 
-drainP :: Sources (IO()) a -> Sinks (IO()) a -> IO ()
+drainP :: KnownNat ar => Sources ar (IO()) a -> Sinks ar (IO()) a -> IO ()
 drainP (Sources srcs) (Sinks snks) = do
-  mvs <- forM (zip srcs snks) $ \(s,t) -> do
+  mvs <- forM (GHC.Exts.toList srcs `zip` GHC.Exts.toList snks) $ \(s,t) -> do
     mv <- newEmptyMVar
     _  <- forkFinally (fwd s t) (\_ -> putMVar mv ())
     return mv
