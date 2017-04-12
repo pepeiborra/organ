@@ -1,0 +1,25 @@
+name:                organ
+version:             0.1.0.0
+-- synopsis:            
+-- description:         
+license:             BSD3
+license-file:        LICENSE
+author:              Jean Philippe Bernardy, Josef Svenningson, Pepe Iborra
+maintainer:          pepeiborra@gmail.com
+-- copyright:           
+-- category:            
+build-type:          Simple
+extra-source-files:  ChangeLog.md
+cabal-version:       >=1.10
+
+library
+  hs-source-dirs:      src
+  exposed-modules:     Organ
+                       Organ.Fusion.Source
+                       Organ.Bundles
+  -- other-modules:       
+  -- other-extensions:    
+  build-depends:       base, contravariant, newtype-generics, primitive, vector, foldl, ghc-prim, ghc-typelits-natnormalise
+  -- hs-source-dirs:      
+  default-language:    Haskell2010
+  ghc-options:         -O2
