@@ -119,7 +119,7 @@ toListSnk k (Source s0 step) = loopSnk SPEC k s0 where
   Delay s -> loopSrc SPEC s $ \res -> k res
   Cons a s -> loopSrc SPEC s $ \res -> k (a : res)
 
- loopSrc !_ acc s0 = undefined
+ loopSrc !_ _acc _s0 = undefined -- TODO
 
 -- FIXME this is doing a left fold, which is a bad way of building a list
 toListSnk_bad :: N [a] -> Snk a

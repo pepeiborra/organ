@@ -1,7 +1,7 @@
 flags: {}
 extra-package-dbs: []
 packages:
-- '.'
+- location: 'Organ'
 system-ghc: false
 extra-deps:
 - hspec-checkers-0.1.0.2

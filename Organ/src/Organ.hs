@@ -10,12 +10,10 @@
 {-# LANGUAGE ViewPatterns         #-}
 module Organ where
 
-import           Control.Monad.IO.Class
 import           Control.Newtype
 import           Data.Char
 import           Data.Functor.Contravariant
 import           Data.Monoid
-import           Data.Primitive.MutVar
 import           GHC.Generics
 import           System.IO
 
@@ -178,7 +176,7 @@ toListSnk k (Cons a s) = toList s (k . (a :))
 -- toList2 = foldSrc (:) []
 
 handleSrc :: Handle -> (Handle -> IO a) -> Src (IO()) a
-handleSrc h get Full = hClose h
+handleSrc h _    Full = hClose h
 handleSrc h get (Cont c) = do
   e <- hIsEOF h
   if e then do hClose h
