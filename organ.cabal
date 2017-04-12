@@ -17,6 +17,7 @@ library
   exposed-modules:     Organ
                        Organ.Fusion.Source
                        Organ.Bundles
+                       Data.Vec
   -- other-modules:       
   -- other-extensions:    
   build-depends:       base, contravariant, newtype-generics, primitive, vector, foldl, ghc-prim, ghc-typelits-natnormalise
