@@ -19,17 +19,19 @@ library
                        Organ.Fusion.Source
                        Organ.Bundles
                        Organ.Streams
+                       Data.Functor.Nly
                        Data.Vector.Unboxed.Mutable.Indexed.Length
                        Data.Vector.Mutable.Indexed.Length
                        GHC.TypeLits.Extra
   -- other-modules:       
   -- other-extensions:    
   build-depends:       base,
+                       arrow-list,
                        constraints,
                        contravariant,
+                       exceptions,
                        finite-typelits,
                        lens,
-                       newtype-generics,
                        primitive,
                        vector,
                        vector-sized,

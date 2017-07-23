@@ -18,8 +18,11 @@
 {-# LANGUAGE ViewPatterns               #-}
 {-# OPTIONS_GHC -Wno-partial-type-signatures #-}
 module Organ.Bundles
-  ( Input
-  , Output
+  ( Input(..)
+  , sources
+  , traverseInput
+  , Output(..)
+  , sinks
   , Funnel(..)
   , Unfunnel(..)
   , Organ.Bundles.drain
@@ -28,10 +31,10 @@ module Organ.Bundles
   )where
 
 import           Control.Concurrent
-import           Control.Exception
 import           Control.Lens                               as Lens
 import           Control.Lens.Extras
 import           Control.Monad
+import           Control.Monad.Catch
 import           Control.Monad.IO.Class
 import           Control.Monad.Primitive
 import           Data.Finite
@@ -44,10 +47,7 @@ import qualified Data.Vector.Unboxed.Mutable.Indexed.Length as UM
 import           GHC.TypeLits
 import           Organ
 
-data Input m ar a = Input
-  { _sources :: m (V.Vector ar (Src (m ()) a))
-  , _onError :: forall e . Exception e => e -> m ()
-  }
+newtype Input m ar a = Input {_sources :: m (V.Vector ar (Src (m ()) a))}
 
 newtype Output m ar a = Output {_sinks :: m (V.Vector ar (Snk (m()) a))}
 
@@ -58,12 +58,33 @@ instance Functor m => Functor (Input m ar) where
   fmap = over (sources.mapped.mapped.sets mapSrc)
 
 instance (KnownNat ar, Monad m, Monoid (m())) => Applicative (Input m ar) where
-  pure x = Input {_sources = return $ V.replicate (Organ.cons x empty), _onError = throw}
-  f <*> x = Input {_sources = zipped, _onError = \e -> _onError f e *> _onError x e} where
-    zipped = do
+  pure x = Input {_sources = return $ V.replicate (Organ.cons x empty)}
+  f <*> x = Input $ do
       fs <- _sources f
       xs <- _sources x
       return $ fmap (mapSrc (uncurry ($)) . uncurry zipSrc) (V.zip fs xs)
+
+instance (KnownNat ar, MonadIO m, Monoid (m())) => Monoid (Input m ar a) where
+  mempty = Input {_sources = return $ V.replicate empty}
+  mappend inp1 inp2 = Input $ do
+      srcs1 <- inp1 ^. sources
+      srcs2 <- liftIO $ newMVar Nothing
+      let wrap :: Int -> Src (m()) a -> Src (m()) a
+          wrap _ src full@Full{} = src full
+          wrap i src (Cont c) = src $ Cont $ \case
+              Cons a rest -> c $ Cons a (wrap i rest)
+              Done Nothing -> do
+                srcs2v <- liftIO $ takeMVar srcs2
+                case srcs2v of
+                  x@(Just srcs2v) -> do
+                    liftIO $ putMVar srcs2 x
+                    V.unsafeIndex srcs2v i (Cont c)
+                  Nothing -> do
+                    srcs2v <- inp2 ^. sources
+                    liftIO $ putMVar srcs2 (Just srcs2v)
+                    V.unsafeIndex srcs2v i (Cont c)
+              error@Done{} -> c error
+      return $ V.imap wrap srcs1
 
 class (KnownNat ar) => Funnel stream (ar :: Nat) where
   funnel :: stream ar a -> stream 1 a
@@ -78,6 +99,9 @@ instance (KnownNat ar, Functor m, Monoid (m())) => Funnel (Output m) ar where
 class (KnownNat ar) => Unfunnel stream (ar :: Nat) where
   unfunnel :: KnownNat ar' => stream ar a -> stream ar' a
 
+traverseInput :: MonadCatch m => (a -> m b) -> Input m ar a -> Input m ar b
+traverseInput f = over (sources.mapped.mapped) (mapSrcM f)
+
 instance (MonadIO m, PrimMonad m) => Unfunnel (Input m) 1 where
   unfunnel :: forall ar a m.
               (KnownNat ar, MonadIO m, PrimMonad m) =>
@@ -91,16 +115,16 @@ instance (MonadIO m, PrimMonad m) => Unfunnel (Input m) 1 where
     aborted :: UM.MVector ar _ Bool <- UM.replicate False
     -- When all the children have seen a Full, we want to notify the original source
     let run :: Finite ar -> Src (m()) a
-        run i Full = do
+        run i x@Full{} = do
           UM.write aborted i True
-          ifAllThen aborted $ src Full
+          ifAllThen aborted $ src x
         run i (Cont k) = do
           src <- liftIO $ takeMVar state
           src $ Cont $ \source ->
               case source of
-                Done -> do
+                x@Done{} -> do
                   liftIO $ putMVar state src
-                  k Done
+                  k x
                 Cons a src' -> do
                   liftIO $ putMVar state src'
                   k $ Cons a (run i)
@@ -119,18 +143,20 @@ instance (MonadIO m, PrimMonad m) => Unfunnel (Output m) 1 where
       arr <- UM.replicate False
       state <- liftIO $ newMVar parent
       let run :: Finite ar -> Snk (m ()) a
-          run i Done = do
+          run i x@Done{} = do
             UM.write arr i True
             isLast <- andVector arr
             when isLast $ do
-              sink <- liftIO $ takeMVar state
-              sink Done
+              sink <- liftIO $ readMVar state
+              sink x
           run i (Cons a src) = do
             sink <- liftIO $ takeMVar state
             sink $
               Cons a $ \snk ->
                 case snk of
-                  Full -> src Full
+                  x@Full{} -> do
+                    liftIO $ putMVar state sink
+                    src x
                   Cont sink' -> do
                     liftIO $ putMVar state sink'
                     src $ Cont (run i)
@@ -153,7 +179,7 @@ drain inp out = do
     _  <- forkFinally (fwd s t) $ \res -> do
             putMVar mv ()
             case res of
-              Left e  -> (inp^.onError) e
+              Left e  -> throwM e
               Right _ -> return ()
     return mv
   mapM_ takeMVar mvs
@@ -178,12 +204,16 @@ dupSrc
 dupSrc src = do
   state <- liftIO $ newMVar $ DupState Nothing Nothing src
   let run :: (forall b. Prism' (Either b b) b) -> Src (m()) a
-      run me Full = do
+      run me full@Full{} = do
         s@DupState{..} <- liftIO $ takeMVar state
         case aborted of
-          Just _ ->
-            -- Nothing to do, one of them has already been aborted
+          Just x | is me x ->
+            -- Nothing to do, me has already been aborted
             liftIO $ putMVar state s
+          Just _ -> do
+            -- The other one has been aborted, and now me, so abort the parent
+            liftIO $ putMVar state s
+            parent full
           Nothing -> do
             let buffer'
                   | Just x <- buffer
@@ -202,9 +232,9 @@ dupSrc src = do
           _ -> -- Consume and buffer
             parent $ Cont $
               \case
-                Done -> do
+                x@Done{} -> do
                   liftIO $ putMVar state s
-                  k Done
+                  k x
                 Cons a parent' -> do
                   let buffer'
                        | Just _ <- aborted = buffer

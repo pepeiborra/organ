@@ -28,7 +28,9 @@ data Source a = forall s. Source s (s -> N (Choke (N (Step a s))))
 
 {-# INLINE mapS #-}
 {-# INLINE mapF #-}
+mapS :: Bifunctor p => (c -> d) -> p b c -> p b d
 mapS f = bimap id f
+mapF :: Bifunctor p => (a -> b) -> p a d -> p b d
 mapF f = bimap f id
 
 instance Bifunctor Step where
@@ -193,6 +195,7 @@ filterSnk p t (Source s0 step) = t $ Source s0 $
 
 {-# INLINE filterSrc #-}
 {-# INLINE filterSnk #-}
+filterSrc :: (a -> Bool) -> Src a -> Src a
 filterSrc p = flipSnk(filterSnk p)
 
 hFileSnk :: Handle -> Snk String
