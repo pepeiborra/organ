@@ -3,11 +3,10 @@
 {-# LANGUAGE DeriveGeneric        #-}
 {-# LANGUAGE FlexibleContexts     #-}
 {-# LANGUAGE FlexibleInstances    #-}
-{-# LANGUAGE LambdaCase           #-}
 {-# LANGUAGE RankNTypes           #-}
 {-# LANGUAGE TypeFamilies         #-}
 {-# LANGUAGE TypeSynonymInstances #-}
-{-# LANGUAGE ViewPatterns         #-}
+{-# OPTIONS -fdefer-type-errors   #-}
 module Organ where
 
 import           Control.Newtype
@@ -26,8 +25,13 @@ shift x k = k x
 unshift :: N m (NN m a) -> N m a
 unshift k x = k (shift x)
 
-data Source m a = Done | Cons a (Src m a) -- Cons a (N(Sink a))
-data Sink   m a = Full | Cont   (Snk m a) -- Cont (N(Source a))
+data Source m a = Done | Cons a (Src m a) -- Cons a (Sink a -> m)
+data Sink   m a = Full | Cont   (Snk m a) -- Cont (Source a -> m)
+
+forward :: Monoid m => Source m a -> Sink m a -> m
+forward s (Cont s')      = s' s
+forward Done Full        = mempty
+forward (Cons _ xs) Full = xs Full
 
 instance Functor (Source m) where
   fmap _ Done       = Done
@@ -36,6 +40,11 @@ instance Functor (Source m) where
 instance Contravariant (Sink m) where
   contramap _ Full     = Full
   contramap f (Cont k) = Cont (k . fmap f)
+
+-- | Builds a new 'Src' from the pull and abort continuations
+newSrc :: ((a -> Src m a -> m) -> m -> m) -> m -> Src m a
+newSrc _pull abort Full = abort
+newSrc pull _abort (Cont k) = pull (\a src -> k $ Cons a src) (k Done)
 
 -- breaks linearity ? I don't understand
 pull :: Source m a -> m -> (a -> Source m a -> m) -> m
@@ -46,20 +55,16 @@ push :: a -> Sink m a -> Src m a -> m
 push x (Cont c) k = c (Cons x k)
 push _ Full k     = k Full
 
-eject :: Monoid m => Sink m a -> m
-eject Full     = mempty
-eject (Cont c) = c Done
-
 drain :: Monoid m => Source m a -> Sink m a -> m
 drain s (Cont s')     = s' s
 drain Done Full       = mempty
 drain (Cons _ k) Full = k Full
 
 type Src m a = N m (Sink m a)   -- Sink m a -> m
-type Snk m a = N m (Source m a) -- Src  a -> m
+type Snk m a = N m (Source m a) -- Source m a -> m
 
 empty :: Monoid m => Src m a
-empty sink = drain Done sink
+empty = drain Done
 
 plug :: Monoid m => Snk m a
 plug source = drain source Full
@@ -124,7 +129,7 @@ dropSnk _ s Done         = s Done
 dropSnk 0 s s'           = s s'
 dropSnk n s (Cons _a xs) = shiftSrc (dropSrc (n-1) xs) s
 
-takeSnk _ s Done = s Done
+takeSnk _ s Done        = s Done
 takeSnk 0 s (Cons _ s') = s' Full <> s Done
 takeSnk n s (Cons a s') = s $ Cons a $ takeSrc (n-1) s'
 
@@ -162,7 +167,7 @@ foldSrc :: Monoid m => (acc -> a -> acc) -> acc -> (acc -> b) -> Src m a -> NN m
 foldSrc f !z proj src nb = src $ Cont $ foldSnk f z proj nb
 
 foldSnk :: Monoid m => (acc -> a -> acc) -> acc -> (acc -> b) -> N m b -> Snk m a
-foldSnk _ !z proj nb  Done       = nb $ proj z
+foldSnk _ !z proj nb  Done      = nb $ proj z
 foldSnk f !z proj nb (Cons a s) = foldSrc f (f z a) proj s nb
 
 toList :: Src m a -> NN m [a]
@@ -209,6 +214,26 @@ collapseSnk t1 t2 (Cons a s) =
 -- | Also known as dup_io
 tee :: Monoid m => Src m a -> Snk m a -> Src m a
 tee s t = flipSnk (collapseSnk t) s
+
+zipSrc :: Monoid m => Src m t1 -> Src m t -> Src m (t1, t)
+zipSrc s1 s2 t3 = shiftSrc s2 $ \s -> unshiftSrc (\t -> forkSnk t s1 s) t3
+
+forkSnk :: Monoid m => Snk m (t1, t) -> Src m t1 -> Snk m t
+forkSnk sab ta tb =
+  shiftSrc ta $ \ta' ->
+    case ta' of
+      Done -> forward tb Full <> sab Done
+      Cons a as -> case tb of
+        Done      -> as Full <> sab Done
+        Cons b bs -> fwd (cons (a, b) $ zipSrc as bs) sab
+
+forkSrc :: Monoid t => Src t (a1, a) -> Snk t a1 -> Src t a
+forkSrc sab ta tb = shiftSnk (zipSnk ta (`forward` tb)) sab
+
+zipSnk :: Monoid t => Snk t a1 -> Snk t a -> Snk t (a1, a)
+zipSnk sa sb Done = sa Done <> sb Done
+zipSnk sa sb (Cons (a, b) tab) =
+  sa $ Cons a $ \sa' -> sb $ Cons b $ \sb' -> forkSrc tab (`forward` sa') sb'
 
 -- -------------------------------
 -- Functors on function arguments

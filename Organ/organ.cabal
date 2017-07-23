@@ -18,6 +18,7 @@ library
   exposed-modules:     Organ
                        Organ.Fusion.Source
                        Organ.Bundles
+                       Organ.Streams
                        Data.Vector.Unboxed.Mutable.Indexed.Length
                        Data.Vector.Mutable.Indexed.Length
                        GHC.TypeLits.Extra
@@ -27,6 +28,7 @@ library
                        constraints,
                        contravariant,
                        finite-typelits,
+                       lens,
                        newtype-generics,
                        primitive,
                        vector,
