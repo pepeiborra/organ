@@ -4,17 +4,76 @@
 {-# LANGUAGE FlexibleInstances     #-}
 {-# LANGUAGE LambdaCase            #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE OverloadedLists       #-}
 {-# LANGUAGE RankNTypes            #-}
+{-# LANGUAGE RecordWildCards       #-}
 {-# LANGUAGE ScopedTypeVariables   #-}
 {-# LANGUAGE TypeFamilies          #-}
 {-# LANGUAGE TypeSynonymInstances  #-}
-module Organ where
+{-# LANGUAGE ViewPatterns          #-}
+module Organ
+  (
+  -- * Negations
+    N, NN
+  , shift, unshift
+  -- * Sources and Sinks
+  , Source(..), Sink(..)
+  , Src, Snk
+  -- ** Constructors
+  , empty, plug
+  , newSrc
+  , handleSrc
+  , fileSrc
+  , Organ.each
+  -- ** Execution
+  , toListSrc, toListSnk
+  , forward, fwd
+  , drain
+  -- ** Operations
+  , pull, push
+  , mapSrc, mapSnk
+  , traverseSrc, traverseSnk
+  , onSource, onSink
+  , shiftSrc, shiftSnk
+  , unshiftSrc, unshiftSnk
+  , flipSrc, flipSnk
+  , cons, Organ.tail
+  , filterSrc, filterSnk
+  , takeSrc, takeSnk
+  , dropSrc, dropSnk
+  , dropWhileSrc, dropWhileSnk
+  , breakSrc, unbreakSnk
+  , linesSrc
+  , wordsSrc, wordsSnk
+  , foldSrc, foldSnk
+  , collapseSnk
+  , tee
+  , zipSrc, zipSnk
+  , forkSrc, forkSnk
+  , dupSrc
+  , groupSrc
+  , mergeSrc
+  , chunkSrc
+  , unchunkSrc
+  , dmux
+  , CoSrc, CoSnk
+  , mapCoSrc, mapCoSnk
+  , mux
+  , Schedule, scheduleSrc, scheduleSnk
+  , sequentially, concurrently
+  )where
 
-import           Control.Lens        hiding (cons)
+import           Control.Concurrent
+import           Control.Lens           hiding (cons, each)
+import           Control.Lens.Extras
+import           Control.Monad
 import           Control.Monad.Catch
+import           Control.Monad.IO.Class
 import           Data.Char
 import           Data.Functor.Nly
+import           Data.List.NonEmpty     (NonEmpty (..), nonEmpty)
 import           Data.Monoid
+import qualified Data.Semigroup         as S
 import           System.IO
 
 type N m a = a -> m
@@ -26,8 +85,11 @@ shift x k = k x
 unshift :: N m (NN m a) -> N m a
 unshift k x = k (shift x)
 
-data Source m a = Done (Maybe SomeException) | Cons a (Src m a) -- Cons a (Sink a -> m)
+data Source m a = Done (Maybe SomeException) | Cons a (Src m a)
 data Sink   m a = Full (Maybe SomeException) | Cont   (Snk m a) -- Cont (Source a -> m)
+
+type Src m a = N m (Sink m a)   -- Sink m a -> m
+type Snk m a = N m (Source m a) -- Source m a -> m
 
 forward :: Monoid m => Source m a -> Sink m a -> m
 forward s (Cont s')          = s' s
@@ -61,9 +123,6 @@ drain s (Cont s')         = s' s
 drain Done{} Full{}       = mempty
 drain (Cons _ k) x@Full{} = k x
 
-type Src m a = N m (Sink m a)   -- Sink m a -> m
-type Snk m a = N m (Source m a) -- Source m a -> m
-
 empty :: Monoid m => Src m a
 empty = drain (Done Nothing)
 
@@ -73,15 +132,17 @@ plug source = drain source (Full Nothing)
 mapSrc :: (a -> b) -> Src m a -> Src m b
 mapSrc f = under _Nly (fmap f)
 
-mapSrcM :: MonadCatch m => (a -> m b) -> Src (m()) a -> Src (m()) b
-mapSrcM _ src (Full e) = src (Full e)
-mapSrcM f src (Cont k) = src $ Cont $ \case
-  Done e -> k $ Done e
-  Cons a rest -> do
-    b <- try $ f a
-    case b of
-      Right b -> k (Cons b $ mapSrcM f rest)
-      Left e  -> k (Done (Just e)) *> throwM e
+traverseSrc :: MonadCatch m => (a -> m b) -> Src (m()) a -> Src (m()) b
+traverseSrc _ src (Full e) = src $ Full e
+traverseSrc f src (Cont k) = src $ Cont $ traverseSnk f k
+
+traverseSnk :: MonadCatch m => (b -> m a) -> Snk (m()) a -> Snk (m()) b
+traverseSnk _ snk (Done e)    = snk (Done e)
+traverseSnk f snk (Cons x xs) = do
+  b <- try $ f x
+  case b of
+    Right b -> snk (Cons b $ traverseSrc f xs)
+    Left e -> snk (Done (Just e)) *> throwM e
 
 mapSnk :: (a -> b) -> Snk m b -> Snk m a
 mapSnk f = under _Nly (contramap f)
@@ -157,13 +218,26 @@ breakSrc :: Monoid m => (a -> Bool) -> Src m a -> Src m [a]
 breakSrc f = flipSnk (unbreakSnk f)
 
 unbreakSnk :: Monoid m => (a -> Bool) -> Snk m [a] -> Snk m a
-unbreakSnk f = loop_snk [] where
-  loop_snk []  s (Done e) = s $ Done e
-  loop_snk acc s (Done Nothing) = s $ Cons (reverse acc) empty
-  loop_snk _   s (Done e@Just{}) = s (Done e)
-  loop_snk acc s (Cons a xs)
+unbreakSnk f s = loop_snk [] where
+  loop_snk []  (Done e) = s $ Done e
+  loop_snk acc (Done Nothing) = s $ Cons (reverse acc) empty
+  loop_snk _   (Done e@Just{}) = s (Done e)
+  loop_snk acc (Cons a xs)
     | f a = s $ Cons (reverse acc) (breakSrc f xs)
-    | otherwise = xs $ Cont $ loop_snk (a:acc) s
+    | otherwise = xs $ Cont $ loop_snk (a:acc)
+
+chunkSrc :: Monoid m => Int -> Src m a -> Src m [a]
+chunkSrc n = flipSnk (unsplitSnk n)
+
+unsplitSnk :: Monoid m => Int -> Snk m [a] -> Snk m a
+unsplitSnk 0 _ = error "cannot split in chunks of 0 elements"
+unsplitSnk n s = loop_unsplit (0,id) where
+  loop_unsplit (0,_)  (Done e) = s $ Done e
+  loop_unsplit (_,acc) (Done Nothing) = s $ Cons (acc []) mempty
+  loop_unsplit _ (Done e) = s (Done e)
+  loop_unsplit (i,acc) (Cons x xs)
+    | i == n - 1 = s $ Cons (acc [x]) (chunkSrc n xs)
+    | otherwise = xs $ Cont $ loop_unsplit (i+1, acc . (x:))
 
 linesSrc, wordsSrc :: Monoid m => Src m Char -> Src m String
 linesSrc = breakSrc (=='\n')
@@ -187,13 +261,13 @@ foldSnk _ !z proj nb (Done Nothing)  = nb $ proj z
 foldSnk _ !_ _    _  (Done (Just e)) = throwM e
 foldSnk f !z proj nb (Cons a s)      = foldSrc f (f z a) proj s nb
 
-toList :: MonadThrow m => Src (m()) a -> NN (m()) [a]
-toList s k = shiftSrc s (toListSnk k)
+toListSrc :: MonadThrow m => Src (m()) a -> NN (m()) [a]
+toListSrc s k = shiftSrc s (toListSnk k)
 
 toListSnk :: MonadThrow m => N (m()) [a] -> Snk (m()) a
 toListSnk _ (Done (Just e)) = throwM e
 toListSnk k (Done Nothing)  = k []
-toListSnk k (Cons a s)      = toList s (k . (a :))
+toListSnk k (Cons a s)      = toListSrc s (k . (a :))
 
 -- would need difference lists, or reverse
 -- toList2 = foldSrc (:) []
@@ -208,9 +282,9 @@ handleSrc h get (Cont c) = handle (c . Done . Just) $ do
             c (Cons x $ handleSrc h get)
 
 fileSrc :: FilePath -> (Handle -> IO a) -> Src (IO()) a
-fileSrc f get sink = do
+fileSrc f get snk = do
   h <- openFile f ReadMode
-  handleSrc h get sink
+  handleSrc h get snk
 
 instance {-# OVERLAPPING #-} Monoid m => Monoid (Src m a) where
   mempty = empty
@@ -255,3 +329,139 @@ zipSnk sa sb (Done e) = sa (Done e) <> sb (Done e)
 zipSnk sa sb (Cons (a, b) tab) =
   sa $ Cons a $ \sa' -> sb $ Cons b $ \sb' -> forkSrc tab (`forward` sa') sb'
 
+data DupState m a = DupState
+  { aborted :: Maybe (Either () ())
+  , buffer  :: Maybe (Either (NonEmpty a) (NonEmpty a))
+  , parent  :: Src m a
+  }
+
+dupSrc
+  :: forall m a .
+  (MonadIO m)
+  => Src (m ()) a -> m (Src (m ()) a, Src (m ()) a)
+dupSrc src = do
+  state <- liftIO $ newMVar $ DupState Nothing Nothing src
+  let run :: (forall b. Prism' (Either b b) b) -> Src (m()) a
+      run me full@Full{} = do
+        s@DupState{..} <- liftIO $ takeMVar state
+        case aborted of
+          Just x | is me x ->
+            -- Nothing to do, me has already been aborted
+            liftIO $ putMVar state s
+          Just _ -> do
+            -- The other one has been aborted, and now me, so abort the parent
+            liftIO $ putMVar state s
+            parent full
+          Nothing -> do
+            let buffer'
+                  | Just x <- buffer
+                  , is me x = Nothing
+                  | otherwise = buffer
+            liftIO $ putMVar state DupState{ aborted = Just (review me ())
+                                           , buffer = buffer'
+                                           , ..}
+      run me (Cont k) = do
+        s@DupState{..} <- liftIO $ takeMVar state
+        case buffer of
+          -- Catch up with other src
+          Just (preview me -> Just (x :| rest)) -> do
+            liftIO $ putMVar state $ s{buffer = fmap (review me) (nonEmpty rest)}
+            k $ Cons x (run me)
+          _ -> -- Consume and buffer
+            parent $ Cont $
+              \case
+                x@Done{} -> do
+                  liftIO $ putMVar state s
+                  k x
+                Cons a parent' -> do
+                  let buffer'
+                       | Just _ <- aborted = buffer
+                       | Just b <- buffer = Just $ b & me %~ ([a] S.<>)
+                       | otherwise = Just (review me [a])
+                  liftIO $ putMVar state s{buffer = buffer', parent = parent'}
+                  k $ Cons a (run me)
+  return (run _Left, run _Right)
+
+-- | Remove consecutive duplicates
+groupSrc :: (Eq a, Monoid m) => Src m a -> Src m a
+groupSrc = flipSnk groupSnk
+
+-- | Remove consecutive duplicates
+groupSnk :: forall a m . (Eq a, Monoid m) => Snk m a -> Snk m a
+groupSnk = go Nothing where
+  goSrc x = flipSnk (go x)
+  go :: Maybe a -> Snk m a -> Snk m a
+  go _ s x@Done{} = s x
+  go Nothing  s (Cons x xs) = s $ Cons x $ flipSnk (go (Just x)) xs
+  go (Just x) s (Cons x' xs)
+    | x == x'   = shiftSrc (goSrc (Just x) xs) s
+    | otherwise = go Nothing s (Cons x' xs)
+
+-- | Sorted merge of two sources
+mergeSrc :: Ord a => Src m a -> Src m a -> Src m a
+mergeSrc s1 s2 = undefined s1 s2
+
+unchunkSrc :: (Foldable t, Monoid m) => Src m (t a) -> Src m a
+unchunkSrc = flipSnk chunkSnk
+
+chunkSnk :: (Monoid m, Foldable t)=> Snk m a -> Snk m (t a)
+chunkSnk s (Done e) = s (Done e)
+chunkSnk s (Cons x xs) = fwd (each x <> unchunkSrc xs) s
+
+dmux :: Monoid m => Src m (Either a b) -> Snk m a -> Snk m b -> m
+dmux sab ta tb = shiftSnk ta $ \ta' -> shiftSnk tb $ \tb' -> shiftSrc sab $ \sab' -> dmux' sab' ta' tb'
+
+dmux' :: Monoid m => Source m (Either a b) -> Sink m a -> Sink m b -> m
+dmux' (Done e) ta tb = forward (Done e) ta <> forward (Done e) tb
+dmux' (Cons (Left a) rest) ta tb = rest $ Cont $ \src' ->
+  case ta of
+    Full e -> forward (Done Nothing) tb <> drain src' (Full e)
+    Cont k -> k $ Cons a $ \ta' -> dmux' src' ta' tb
+dmux' (Cons (Right b) rest) ta tb = rest $ Cont $ \src' ->
+  case tb of
+    Full e -> forward (Done Nothing) ta <> drain src' (Full e)
+    Cont k -> k $ Cons b $ \tb' -> dmux' src' ta tb'
+
+-- ------------------------------------------------------------
+
+type CoSrc m a = Snk m (N m a)
+type CoSnk m a = Src m (N m a)
+
+type Neither m a b = N m (Either (N m a) (N m b))
+
+nnElimSrc :: Monoid m => Src m (NN m a) -> Src m a
+nnElimSrc = flipSnk nnIntroSnk
+
+nnElimSnk :: Monoid m => Snk m (NN m a) -> Snk m a
+nnElimSnk = mapSnk shift
+
+nnIntroSnk :: Monoid m => Snk m a -> Snk m (NN m a)
+nnIntroSnk k (Done e) = k (Done e)
+nnIntroSnk k (Cons x src) = x $ \x' -> k $ Cons x' (nnElimSrc src)
+
+mux :: Monoid m => CoSrc m a -> CoSrc m b -> CoSrc m (Neither m a b)
+mux sa sb = unshiftSnk $ \tab -> dmux (nnElimSrc tab) sa sb
+
+mapCoSrc :: Monoid m => (a -> b) -> CoSrc m a -> CoSrc m b
+mapCoSrc f = mapSnk (\ k a -> k $ f a)
+
+mapCoSnk :: Monoid m => (b -> a) -> CoSnk m a -> CoSnk m b
+mapCoSnk f = mapSrc (\ k a -> k $ f a)
+
+type Schedule m = forall a. Source m a -> Source m (N m a) -> m
+
+scheduleSrc :: Schedule m -> Src m a -> CoSrc m a
+scheduleSrc sched src sink = shiftSrc src $ \source -> sched source sink
+
+scheduleSnk :: Schedule m -> CoSnk m a -> Snk m a
+scheduleSnk sched src sink = shiftSrc src $ \source -> sched sink source
+
+sequentially :: Monoid m => Schedule m
+sequentially (Done e)    (Cons _ k)  = k (Full e)
+sequentially (Cons _ k)  (Done e)    = k (Full e)
+sequentially Done{}      Done{}      = mempty
+sequentially (Cons a aa) (Cons ka kaa) = ka a <> shiftSrc aa (\aa -> shiftSrc kaa $ \kaa -> sequentially aa kaa)
+
+concurrently :: Schedule (IO ())
+concurrently (Cons a aa) (Cons ka kaa) = void(forkIO(ka a)) <> shiftSrc aa (\aa -> shiftSrc kaa $ \kaa -> concurrently aa kaa)
+concurrently a b = sequentially a b

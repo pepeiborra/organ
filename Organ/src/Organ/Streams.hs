@@ -8,35 +8,29 @@ import           Control.Arrow
 import           Control.Arrow.Kleisli.Class
 import           Control.Category            (Category)
 import qualified Control.Category
-import           Control.Lens
-import           Control.Monad
 import           Control.Monad.Catch
 import           Control.Monad.IO.Class
 import           GHC.TypeLits
-import           Organ.Bundles
+import           Organ.Bundles as Bundles
 
-newtype Stream m ar a b = Stream (Input m ar a -> m (Input m ar b))
+newtype SourcesA m ar a b = SourcesA (Sources m ar a -> Sources m ar b)
 
-instance (KnownNat ar, Monad m) => Category (Stream m ar) where
-  id = Stream return
-  Stream s1 . Stream s2 = Stream (s2 >=> s1)
+instance (KnownNat ar, Monad m) => Category (SourcesA m ar) where
+  id = SourcesA id
+  SourcesA s1 . SourcesA s2 = SourcesA (s1 . s2)
 
-instance (KnownNat ar, MonadIO m, Monoid (m())) => Arrow (Stream m ar) where
-  arr f = Stream (return . fmap f)
-  first (Stream f) = Stream $ \ab -> do
+instance (KnownNat ar, MonadIO m, Monoid (m())) => Arrow (SourcesA m ar) where
+  arr f = SourcesA (fmap f)
+  first (SourcesA f) = SourcesA $ \ab -> Bundles.join $ do
     (fmap fst -> a, fmap snd -> b) <- dup ab
-    a' <- f a
-    return $ (,) <$> a' <*> b
+    return $ (,) <$> f a <*> b
 
 instance (KnownNat ar, MonadIO m, MonadCatch m, Monoid (m ())) =>
-         ArrowKleisli m (Stream m ar) where
-  arrM f = Stream (return . traverseInput f)
+         ArrowKleisli m (SourcesA m ar) where
+  arrM f = SourcesA (traverseSources f)
 
-instance (KnownNat ar, MonadIO m, Monoid(m())) => ArrowZero (Stream m ar) where
-  zeroArrow = Stream $ \_ -> return mempty
+instance (KnownNat ar, MonadIO m, Monoid(m())) => ArrowZero (SourcesA m ar) where
+  zeroArrow = SourcesA $ \_ -> mempty
 
-instance (KnownNat ar, MonadIO m, Monoid(m())) => ArrowPlus (Stream m ar) where
-  Stream s1 <+> Stream s2 = Stream $ \i -> do
-    i1 <- s1 i
-    let i2 = Input $ join $ view sources <$> s2 i
-    return (i1 `mappend` i2)
+instance (KnownNat ar, MonadIO m, Monoid(m())) => ArrowPlus (SourcesA m ar) where
+  SourcesA s1 <+> SourcesA s2 = SourcesA $ \i -> s1 i `mappend` s2 i
